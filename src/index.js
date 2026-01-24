@@ -690,10 +690,12 @@ async function processAndSaveFile(msg, fileInfo, config, origin) {
     const data = {
       token: BOT_TOKEN,
       path: fileResult.result.file_path,
+      file_id: fileInfo.fileId, // 保存 file_id 用于刷新链接
       filename: fileInfo.filename,
       message_id: messageId,
       message_thread_id: msg.message_thread_id || null,
-      chat_id: chatId
+      chat_id: chatId,
+      file_size: fileInfo.fileSize || fileResult.result.file_size
     };
     
     const encrypted = await encryptData(JSON.stringify(data), ENCRYPTION_KEY);
@@ -730,22 +732,35 @@ async function sendFileNotification(token, chatId, result, replyToMessageId) {
   const icon = getFileTypeIcon(result.filename);
   const size = formatSize(result.size);
   const time = formatBeijingTime(new Date());
+  const isLargeFile = result.size && result.size > 20 * 1024 * 1024;
   
-  const text = `✅ <b>文件已保存</b>\n\n` +
+  let text = `✅ <b>文件已保存</b>\n\n` +
     `${icon} <b>文件名:</b> ${escapeHtml(result.filename)}\n` +
     `📦 <b>大小:</b> ${size}\n` +
     `🔢 <b>消息ID:</b> <code>${result.messageId}</code>\n` +
     `⏰ <b>时间:</b> ${time}\n\n` +
     `🔗 <b>下载链接:</b>\n<code>${result.downloadUrl}</code>`;
   
-  const keyboard = {
-    inline_keyboard: [
-      [
-        { text: '🔗 打开链接', url: result.downloadUrl },
-        { text: '📨 查看原消息', url: result.telegramLink }
-      ]
-    ]
-  };
+  if (isLargeFile) {
+    text += `\n\n⚠️ <b>注意:</b> 此文件超过 20MB，请点击下方按钮在 Telegram 中直接下载。`;
+  }
+  
+  const keyboard = { inline_keyboard: [] };
+  
+  if (isLargeFile) {
+    // 大文件优先显示 Telegram 链接
+    keyboard.inline_keyboard.push([
+      { text: '📱 在 Telegram 中下载', url: result.telegramLink }
+    ]);
+    keyboard.inline_keyboard.push([
+      { text: '🔗 打开代理链接 (查看说明)', url: result.downloadUrl }
+    ]);
+  } else {
+    keyboard.inline_keyboard.push([
+      { text: '🔗 打开链接', url: result.downloadUrl },
+      { text: '📨 查看原消息', url: result.telegramLink }
+    ]);
+  }
   
   await sendMessage(token, chatId, text, {
     reply_to_message_id: replyToMessageId,
@@ -783,7 +798,8 @@ async function handleCommand(msg, config, origin) {
     '/search': () => handleSearchCommand(chatId, args.join(' '), isUserAdmin, config, origin),
     '/delete': () => handleDeleteCommand(chatId, args[0], isUserAdmin, config),
     '/clean': () => handleCleanCommand(chatId, args[0], isUserAdmin, config),
-    '/verify': () => handleVerifyCommand(chatId, args[0], isUserAdmin, config)
+    '/verify': () => handleVerifyCommand(chatId, args[0], isUserAdmin, config),
+    '/info': () => handleInfoCommand(chatId, args[0], isUserAdmin, config, origin)
   };
   
   const handler = handlers[cmd];
@@ -849,7 +865,10 @@ async function handleHelpCommand(chatId, isUserAdmin, config) {
     `<b>使用方法：</b>\n` +
     `1️⃣ 直接发送文件给我\n` +
     `2️⃣ 将我添加到群组/频道\n` +
-    `3️⃣ 自动生成下载链接\n`;
+    `3️⃣ 自动生成下载链接\n\n` +
+    `<b>⚠️ 文件大小限制：</b>\n` +
+    `• 代理下载: ≤ 20MB\n` +
+    `• 超过 20MB 请在 Telegram 中直接下载\n`;
   
   if (isUserAdmin) {
     text += `\n<b>管理员命令：</b>\n` +
@@ -860,8 +879,9 @@ async function handleHelpCommand(chatId, isUserAdmin, config) {
       `• /listusers - 查看授权用户\n` +
       `• /listchats - 查看授权群组\n` +
       `• /search &lt;关键词&gt; - 搜索文件\n` +
+      `• /info &lt;file_key&gt; - 查看文件详情\n` +
       `• /delete &lt;file_key&gt; - 删除文件\n` +
-      `• /clean [数量] - 清理无效链接\n` +
+      `• /clean - 清理无效链接\n` +
       `• /verify &lt;file_key&gt; - 验证链接\n` +
       `• /stats - 查看统计\n`;
   }
@@ -1475,6 +1495,82 @@ function generateCleanReport(total, checked, valid, invalid, invalidKeys) {
   report += `\n⏰ ${time}`;
   
   return report;
+}
+
+// 查看文件详情命令
+async function handleInfoCommand(chatId, fileKey, isUserAdmin, config, origin) {
+  const { BOT_TOKEN, FILE_DB, ENCRYPTION_KEY } = config;
+  
+  if (!isUserAdmin) {
+    await sendMessage(BOT_TOKEN, chatId, '⛔ 需要管理员权限');
+    return;
+  }
+  
+  if (!fileKey) {
+    await sendMessage(BOT_TOKEN, chatId, 
+      '📄 <b>查看文件详情</b>\n\n' +
+      '用法: <code>/info file_key</code>\n\n' +
+      '示例: <code>/info @channel/123</code>'
+    );
+    return;
+  }
+  
+  try {
+    const result = await FILE_DB.prepare(
+      'SELECT encrypted_data, created_at FROM file_mappings WHERE file_key = ?'
+    ).bind(fileKey).first();
+    
+    if (!result) {
+      await sendMessage(BOT_TOKEN, chatId, `❌ 未找到: <code>${escapeHtml(fileKey)}</code>`);
+      return;
+    }
+    
+    const decrypted = JSON.parse(await decryptData(result.encrypted_data, ENCRYPTION_KEY));
+    const date = formatBeijingTime(new Date(result.created_at * 1000));
+    const icon = getFileTypeIcon(decrypted.filename);
+    const size = formatSize(decrypted.file_size);
+    const telegramLink = generateTelegramLink(decrypted);
+    const downloadUrl = `${origin}/file/${fileKey}`;
+    
+    // 检查文件是否超过 20MB
+    const isLargeFile = decrypted.file_size && decrypted.file_size > 20 * 1024 * 1024;
+    
+    let text = `📄 <b>文件详情</b>\n\n` +
+      `${icon} <b>文件名:</b> ${escapeHtml(decrypted.filename)}\n` +
+      `📦 <b>大小:</b> ${size}\n` +
+      `🔗 <b>Key:</b> <code>${escapeHtml(fileKey)}</code>\n` +
+      `📅 <b>创建时间:</b> ${date}\n\n` +
+      `🔗 <b>下载链接:</b>\n<code>${downloadUrl}</code>\n`;
+    
+    if (isLargeFile) {
+      text += `\n⚠️ <b>注意:</b> 此文件超过 20MB，无法通过代理下载，请在 Telegram 中直接下载。\n`;
+    }
+    
+    const keyboard = { inline_keyboard: [] };
+    
+    if (telegramLink) {
+      keyboard.inline_keyboard.push([
+        { text: '📱 在 Telegram 中打开', url: telegramLink }
+      ]);
+    }
+    
+    if (!isLargeFile) {
+      keyboard.inline_keyboard.push([
+        { text: '🔗 打开下载链接', url: downloadUrl }
+      ]);
+    }
+    
+    keyboard.inline_keyboard.push([
+      { text: '🗑 删除此文件', callback_data: `delete_file_${fileKey}` }
+    ]);
+    
+    await sendMessage(BOT_TOKEN, chatId, text, { 
+      reply_markup: keyboard,
+      disable_web_page_preview: true 
+    });
+  } catch (error) {
+    await sendMessage(BOT_TOKEN, chatId, `❌ 查询失败: ${error.message}`);
+  }
 }
 
 // 验证单个链接命令
@@ -2161,13 +2257,49 @@ async function handleFileDownload(url, db, encryptionKey) {
     }, 404);
   }
   
+  // 检查文件大小是否超过 Bot API 限制 (20MB)
+  const BOT_API_LIMIT = 20 * 1024 * 1024; // 20MB
+  
+  // 先用 HEAD 请求检查文件状态和大小
   const telegramUrl = `https://api.telegram.org/file/bot${fileData.token}/${fileData.path}`;
   
   try {
+    const headResponse = await fetch(telegramUrl, { method: 'HEAD' });
+    
+    if (!headResponse.ok) {
+      // 文件链接已失效，尝试重新获取
+      const refreshed = await refreshFileLink(fileData);
+      if (refreshed) {
+        fileData = refreshed;
+      } else {
+        return jsonResponse({ 
+          error: '文件下载失败', 
+          message: '文件链接已过期，原始文件可能已被删除',
+          telegram_link: generateTelegramLink(fileData),
+          hint: '您可以尝试在 Telegram 中直接查看原消息'
+        }, 404);
+      }
+    }
+    
+    const contentLength = parseInt(headResponse.headers.get('content-length') || '0');
+    
+    // 如果文件超过 20MB，返回备选方案
+    if (contentLength > BOT_API_LIMIT) {
+      const telegramLink = generateTelegramLink(fileData);
+      
+      return new Response(generateLargeFileHtml(fileData, contentLength, telegramLink), {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+    
+    // 正常下载
     const response = await fetch(telegramUrl);
     
     if (!response.ok) {
-      // 文件不存在，可以考虑自动清理
       return jsonResponse({ 
         error: '文件下载失败', 
         message: '原始文件可能已被删除',
@@ -2187,6 +2319,105 @@ async function handleFileDownload(url, db, encryptionKey) {
   } catch (error) {
     return jsonResponse({ error: '下载失败', detail: error.message }, 500);
   }
+}
+
+// 生成 Telegram 消息链接
+function generateTelegramLink(fileData) {
+  if (!fileData.chat_id || !fileData.message_id) return null;
+  
+  const chatId = fileData.chat_id.toString();
+  const messageId = fileData.message_id;
+  
+  if (chatId.startsWith('@')) {
+    return `https://t.me/${chatId.substring(1)}/${messageId}`;
+  } else if (chatId.startsWith('-100')) {
+    return `https://t.me/c/${chatId.substring(4)}/${messageId}`;
+  } else {
+    return `https://t.me/c/${chatId.replace('-', '')}/${messageId}`;
+  }
+}
+
+// 尝试刷新文件链接（重新获取 file_path）
+async function refreshFileLink(fileData) {
+  // 如果没有存储 file_id，无法刷新
+  if (!fileData.file_id || !fileData.token) return null;
+  
+  try {
+    const result = await getFile(fileData.token, fileData.file_id);
+    if (result.ok && result.result.file_path) {
+      fileData.path = result.result.file_path;
+      return fileData;
+    }
+  } catch (e) {
+    console.error('刷新文件链接失败:', e);
+  }
+  
+  return null;
+}
+
+// 生成大文件提示页面
+function generateLargeFileHtml(fileData, size, telegramLink) {
+  const sizeText = formatSize(size);
+  const filename = escapeHtml(fileData.filename || '未知文件');
+  const icon = getFileTypeIcon(fileData.filename);
+  
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${filename} - 大文件下载</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-xl max-w-md w-full overflow-hidden">
+    <div class="gradient-bg p-6 text-white text-center">
+      <div class="text-6xl mb-4">${icon}</div>
+      <h1 class="text-xl font-bold mb-1">${filename}</h1>
+      <p class="opacity-80">${sizeText}</p>
+    </div>
+    
+    <div class="p-6">
+      <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
+        <div class="flex items-start gap-3">
+          <span class="text-2xl">⚠️</span>
+          <div>
+            <h3 class="font-semibold text-yellow-800">文件超过 20MB</h3>
+            <p class="text-sm text-yellow-700 mt-1">
+              由于 Telegram Bot API 限制，超过 20MB 的文件无法通过代理下载。
+              请使用以下方式获取文件：
+            </p>
+          </div>
+        </div>
+      </div>
+      
+      ${telegramLink ? `
+      <a href="${telegramLink}" target="_blank" 
+         class="block w-full bg-blue-500 hover:bg-blue-600 text-white text-center py-3 px-4 rounded-lg font-medium transition mb-3">
+        <span class="mr-2">📱</span>在 Telegram 中打开
+      </a>
+      ` : ''}
+      
+      <div class="bg-gray-50 rounded-lg p-4 mt-4">
+        <h4 class="font-semibold text-gray-700 mb-2">💡 其他下载方式</h4>
+        <ul class="text-sm text-gray-600 space-y-2">
+          <li>• 在 Telegram 客户端中直接下载</li>
+          <li>• 使用 Telegram Desktop 下载大文件更快</li>
+          <li>• 第三方工具：tg-files-downloader</li>
+        </ul>
+      </div>
+      
+      <div class="mt-6 text-center text-xs text-gray-400">
+        <p>文件大小限制说明：</p>
+        <p>Bot API: 20MB | 本地 API: 2GB</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
 }
 
 // ==================== API 接口 ====================
@@ -2459,10 +2690,12 @@ async function handleAddForwardedFile(request, config, url) {
     const data = {
       token: BOT_TOKEN,
       path: fileResult.result.file_path,
+      file_id: fileInfo.fileId, // 保存 file_id 用于刷新链接
       filename: fileInfo.filename,
       message_id,
       message_thread_id: message_thread_id || null,
-      chat_id
+      chat_id,
+      file_size: fileInfo.fileSize || fileResult.result.file_size
     };
     
     const encrypted = await encryptData(JSON.stringify(data), ENCRYPTION_KEY);
@@ -2902,6 +3135,62 @@ curl -O "${origin}/file/1826585339/123"</pre>
             <li><code class="bg-gray-100 px-2 py-0.5 rounded">/stats</code> - 统计信息</li>
           </ul>
         </div>
+      </div>
+    </section>
+
+    <!-- 文件大小限制 -->
+    <section class="bg-white rounded-xl shadow-sm p-6 mb-6">
+      <h2 class="text-xl font-bold mb-4">📦 文件大小限制</h2>
+      
+      <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-4">
+        <div class="flex items-start gap-3">
+          <span class="text-2xl">⚠️</span>
+          <div>
+            <h3 class="font-semibold text-yellow-800">Telegram Bot API 限制</h3>
+            <p class="text-sm text-yellow-700 mt-1">
+              由于 Telegram Bot API 的限制，通过代理下载的文件最大为 <b>20MB</b>。
+              超过此大小的文件会显示提示页面，引导用户在 Telegram 中直接下载。
+            </p>
+          </div>
+        </div>
+      </div>
+      
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b">
+              <th class="text-left py-2 px-3">方式</th>
+              <th class="text-left py-2 px-3">下载限制</th>
+              <th class="text-left py-2 px-3">上传限制</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y">
+            <tr>
+              <td class="py-2 px-3 font-semibold">Bot API (本服务)</td>
+              <td class="py-2 px-3">20 MB</td>
+              <td class="py-2 px-3">50 MB</td>
+            </tr>
+            <tr>
+              <td class="py-2 px-3">本地 Bot API 服务器</td>
+              <td class="py-2 px-3">2 GB</td>
+              <td class="py-2 px-3">2 GB</td>
+            </tr>
+            <tr>
+              <td class="py-2 px-3">Telegram 客户端</td>
+              <td class="py-2 px-3">2 GB</td>
+              <td class="py-2 px-3">2 GB</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      
+      <div class="mt-4 p-4 bg-blue-50 rounded-lg">
+        <h4 class="font-semibold text-blue-700 mb-2">💡 大文件下载方案</h4>
+        <ul class="text-sm text-blue-600 space-y-1">
+          <li>• 点击通知中的「在 Telegram 中下载」按钮</li>
+          <li>• 使用 Telegram Desktop 下载速度更快</li>
+          <li>• 自建本地 Bot API 服务器可突破限制</li>
+        </ul>
       </div>
     </section>
 
